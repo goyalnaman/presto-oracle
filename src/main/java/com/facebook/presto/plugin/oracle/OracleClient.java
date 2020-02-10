@@ -13,29 +13,8 @@
  */
 package com.facebook.presto.plugin.oracle;
 
-import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
-import static com.google.common.collect.Iterables.getOnlyElement;
-
-import java.sql.Connection;
-import java.sql.DatabaseMetaData;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Set;
-
-import javax.annotation.Nullable;
-import javax.inject.Inject;
-
-import oracle.jdbc.OracleDriver;
-
-import org.apache.log4j.Logger;
-
-import com.facebook.presto.plugin.jdbc.BaseJdbcClient;
-import com.facebook.presto.plugin.jdbc.BaseJdbcConfig;
-import com.facebook.presto.plugin.jdbc.JdbcColumnHandle;
-import com.facebook.presto.plugin.jdbc.JdbcConnectorId;
-import com.facebook.presto.plugin.jdbc.JdbcTableHandle;
+import com.facebook.presto.plugin.jdbc.*;
+import com.facebook.presto.spi.ConnectorSession;
 import com.facebook.presto.spi.PrestoException;
 import com.facebook.presto.spi.SchemaTableName;
 import com.facebook.presto.spi.TableNotFoundException;
@@ -43,60 +22,92 @@ import com.facebook.presto.spi.type.Type;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
+import oracle.jdbc.driver.OracleDriver;
+
+import javax.inject.Inject;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.*;
+
+import static com.facebook.presto.plugin.jdbc.DriverConnectionFactory.basicConnectionProperties;
+import static com.facebook.presto.spi.StandardErrorCode.NOT_SUPPORTED;
+import static com.google.common.collect.Iterables.getOnlyElement;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 
 /**
  * Implementation of OracleClient. It describes table, schemas and columns behaviours.
  * It allows to change the QueryBuilder to a custom one as well.
- * 
- * @author Marcelo Paes Rech
  *
+ * @author Marcelo Paes Rech
  */
-public class OracleClient extends BaseJdbcClient {
-
-	private static final Logger log = Logger.getLogger(OracleClient.class);
-
+public class OracleClient
+		extends BaseJdbcClient
+{
 	@Inject
 	public OracleClient(JdbcConnectorId connectorId, BaseJdbcConfig config,
-			OracleConfig oracleConfig) throws SQLException {
-		super(connectorId, config, "", new OracleDriver());
-		//the empty "" is to not use a quote to create queries
-		// BaseJdbcClient already gets these properties
-		// connectionProperties.setProperty("user", oracleConfig.getUser());
-		// connectionProperties.setProperty("url", oracleConfig.getUrl());
-		// connectionProperties.setProperty("password",
-		// oracleConfig.getPassword());
+						OracleConfig oracleConfig) throws SQLException
+	{
+		super(connectorId, config, "`", connectionFactory(config, oracleConfig));
+	}
 
+	private static ConnectionFactory connectionFactory(BaseJdbcConfig config, OracleConfig oracleConfig)
+			throws SQLException
+	{
+		Properties connectionProperties = basicConnectionProperties(config);
+		connectionProperties.setProperty("useInformationSchema", "true");
+		connectionProperties.setProperty("nullCatalogMeansCurrent", "false");
+		connectionProperties.setProperty("useUnicode", "true");
+		connectionProperties.setProperty("characterEncoding", "utf8");
+		connectionProperties.setProperty("tinyInt1isBit", "false");
+		if (oracleConfig.isAutoReconnect()) {
+			connectionProperties.setProperty("autoReconnect", String.valueOf(oracleConfig.isAutoReconnect()));
+			connectionProperties.setProperty("maxReconnects", String.valueOf(oracleConfig.getMaxReconnects()));
+		}
+		if (oracleConfig.getConnectionTimeout() != null) {
+			connectionProperties.setProperty("connectTimeout", String.valueOf(oracleConfig.getConnectionTimeout().toMillis()));
+		}
+
+		return new DriverConnectionFactory(new OracleDriver(), config.getConnectionUrl(), connectionProperties);
 	}
 
 	@Override
-	public Set<String> getSchemaNames() {
-		try (Connection connection = driver.connect(connectionUrl,
-				connectionProperties);
-				ResultSet resultSet = connection.getMetaData().getSchemas()) {
+	public Set<String> getSchemaNames()
+	{
+		try (Connection connection = connectionFactory.openConnection();
+			 ResultSet resultSet = connection.getMetaData().getSchemas()) {
 			ImmutableSet.Builder<String> schemaNames = ImmutableSet.builder();
 			while (resultSet.next()) {
 				String schemaName = resultSet.getString(1).toLowerCase();
-				log.info("Listing schemas: " + schemaName);
 				schemaNames.add(schemaName);
 			}
 			return schemaNames.build();
-		} catch (SQLException e) {
-			throw Throwables.propagate(e);
+		}
+		catch (SQLException e) {
+			throw new RuntimeException(e);
 		}
 	}
 
-	protected ResultSet getTables(Connection connection, String schemaName,
-			String tableName) throws SQLException {
-		// Here we put TABLE and SYNONYM when the table schema is another user schema 
-		return connection.getMetaData().getTables(null, schemaName, tableName,
-				new String[] { "TABLE", "SYNONYM" });
+	@Override
+	public void abortReadConnection(Connection connection)
+			throws SQLException
+	{
+		connection.abort(directExecutor());
 	}
 
-	@Nullable
+	protected ResultSet getTables(Connection connection, String schemaName,
+								  String tableName) throws SQLException
+	{
+		// Here we put TABLE and SYNONYM when the table schema is another user schema
+		return connection.getMetaData().getTables(null, schemaName, tableName,
+				new String[]{"TABLE", "SYNONYM"});
+	}
+
 	@Override
-	public JdbcTableHandle getTableHandle(SchemaTableName schemaTableName) {
-		try (Connection connection = driver.connect(connectionUrl,
-				connectionProperties)) {
+	public JdbcTableHandle getTableHandle(SchemaTableName schemaTableName)
+	{
+		try (Connection connection = connectionFactory.openConnection()) {
 			DatabaseMetaData metadata = connection.getMetaData();
 			String jdbcSchemaName = schemaTableName.getSchemaName();
 			String jdbcTableName = schemaTableName.getTableName();
@@ -110,8 +121,8 @@ public class OracleClient extends BaseJdbcClient {
 				while (resultSet.next()) {
 					tableHandles.add(new JdbcTableHandle(connectorId,
 							schemaTableName, resultSet.getString("TABLE_CAT"),
-							resultSet.getString("TABLE_SCHEM"), resultSet
-									.getString("TABLE_NAME")));
+							resultSet.getString("TABLE_SCHEMA"), resultSet
+							.getString("TABLE_NAME")));
 				}
 				if (tableHandles.isEmpty()) {
 					return null;
@@ -122,19 +133,20 @@ public class OracleClient extends BaseJdbcClient {
 				}
 				return getOnlyElement(tableHandles);
 			}
-		} catch (SQLException e) {
-			throw Throwables.propagate(e);
+		}
+		catch (SQLException e) {
+			throw new RuntimeException(e);
 		}
 	}
 
 	@Override
-	public List<JdbcColumnHandle> getColumns(JdbcTableHandle tableHandle) {
-		try (Connection connection = driver.connect(connectionUrl,
-				connectionProperties)) {
+	public List<JdbcColumnHandle> getColumns(ConnectorSession session, JdbcTableHandle tableHandle)
+	{
+		try (Connection connection = connectionFactory.openConnection()) {
 			//If the table is mapped to another user you will need to get the synonym to that table
 			//So, in this case, is mandatory to use setIncludeSynonyms
-			( (oracle.jdbc.driver.OracleConnection)connection ).setIncludeSynonyms(true);
- 			DatabaseMetaData metadata = connection.getMetaData();
+			((oracle.jdbc.driver.OracleConnection) connection).setIncludeSynonyms(true);
+			DatabaseMetaData metadata = connection.getMetaData();
 			String schemaName = tableHandle.getSchemaName().toUpperCase();
 			String tableName = tableHandle.getTableName().toUpperCase();
 			try (ResultSet resultSet = metadata.getColumns(null, schemaName,
@@ -143,13 +155,16 @@ public class OracleClient extends BaseJdbcClient {
 				boolean found = false;
 				while (resultSet.next()) {
 					found = true;
-					Type columnType = toPrestoType(resultSet
-                            .getInt("DATA_TYPE"), resultSet.getInt("COLUMN_SIZE"));
+					JdbcTypeHandle jdbcTypeHandle = new JdbcTypeHandle(resultSet.getInt("DATA_TYPE"),
+							resultSet.getInt("COLUMN_SIZE"),
+							resultSet.getInt("DECIMAL_DIGITS"));
+					Optional<ReadMapping> columnType = toPrestoType(session, jdbcTypeHandle);
+
 					// skip unsupported column types
-					if (columnType != null) {
+					if (columnType.isPresent()) {
 						String columnName = resultSet.getString("COLUMN_NAME");
 						columns.add(new JdbcColumnHandle(connectorId,
-								columnName, columnType));
+								columnName, jdbcTypeHandle, columnType.get().getType()));
 					}
 				}
 				if (!found) {
@@ -163,15 +178,16 @@ public class OracleClient extends BaseJdbcClient {
 				}
 				return ImmutableList.copyOf(columns);
 			}
-		} catch (SQLException e) {
-			throw Throwables.propagate(e);
+		}
+		catch (SQLException e) {
+			throw new RuntimeException(e);
 		}
 	}
 
 	@Override
-	public List<SchemaTableName> getTableNames(@Nullable String schema) {
-		try (Connection connection = driver.connect(connectionUrl,
-				connectionProperties)) {
+	public List<SchemaTableName> getTableNames(String schema)
+	{
+		try (Connection connection = connectionFactory.openConnection()) {
 			DatabaseMetaData metadata = connection.getMetaData();
 			if (metadata.storesUpperCaseIdentifiers() && (schema != null)) {
 				schema = schema.toUpperCase();
@@ -184,15 +200,17 @@ public class OracleClient extends BaseJdbcClient {
 				}
 				return list.build();
 			}
-		} catch (SQLException e) {
-			throw Throwables.propagate(e);
+		}
+		catch (SQLException e) {
+			throw new RuntimeException(e);
 		}
 	}
 
 	@Override
 	protected SchemaTableName getSchemaTableName(ResultSet resultSet)
-			throws SQLException {
-		String tableSchema = resultSet.getString("TABLE_SCHEM");
+			throws SQLException
+	{
+		String tableSchema = resultSet.getString("TABLE_SCHEMA");
 		String tableName = resultSet.getString("TABLE_NAME");
 		if (tableSchema != null) {
 			tableSchema = tableSchema.toLowerCase();
@@ -204,7 +222,8 @@ public class OracleClient extends BaseJdbcClient {
 	}
 
 	@Override
-	protected String toSqlType(Type type) {
+	protected String toSqlType(Type type)
+	{
 		//just for debug
 		String sqlType = super.toSqlType(type);
 		return sqlType;
